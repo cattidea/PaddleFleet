@@ -530,12 +530,73 @@ class TestHybridEPDispatchBoundary(unittest.TestCase):
         )
 
         dispatch_kwargs = buffer.dispatch_calls[-1]
-        self.assertIs(dispatch_kwargs["routing_map"], routing_map)
+        self.assertEqual(dispatch_kwargs["hidden"].shape, [128, 4])
+        self.assertEqual(dispatch_kwargs["routing_map"].shape, [128, 2])
+        self.assertEqual(
+            dispatch_kwargs["routing_map"][:2].numpy().tolist(),
+            routing_map.numpy().tolist(),
+        )
+        self.assertEqual(
+            dispatch_kwargs["routing_map"][2:].astype("int64").sum().item(), 0
+        )
         self.assertFalse(dispatch_kwargs["use_fp8"])
         self.assertIsNone(dispatch_kwargs["pad_multiple"])
         self.assertTrue(dispatch_kwargs["non_blocking"])
         self.assertIs(manager.padded_tokens_per_expert, padded_counts)
+        self.assertEqual(manager.num_permuted_tokens, 2)
         self.assertEqual(manager.tokens_per_expert.numpy().tolist(), [1, 1])
+
+    def test_dispatch_pads_rank_tokens_to_chunk_multiple(self):
+        routing_map = paddle.to_tensor(
+            [[True, False], [False, True], [True, False]], dtype="bool"
+        )
+        routing_probs = paddle.to_tensor(
+            [[1.0, 0.0], [0.0, 1.0], [0.5, 0.0]], dtype="float32"
+        )
+        manager = _new_hybrid_manager(
+            group=_HybridEPGroup(nranks=1),
+            router_topk=1,
+            num_experts=2,
+            num_local_experts=2,
+            routing_map=routing_map,
+            routing_probs=routing_probs,
+        )
+        buffer = _RecordingHybridEPBuffer(
+            dispatch_results=[
+                (
+                    paddle.zeros([3, 4], dtype="float32"),
+                    paddle.ones([3], dtype="float32"),
+                    None,
+                    paddle.to_tensor([2, 1], dtype="int64"),
+                    _make_hybrid_ep_handle(
+                        num_dispatched_tokens=3,
+                        local_expert_routing_map=routing_map,
+                    ),
+                )
+            ]
+        )
+        _bind_buffer(manager, buffer)
+
+        manager._dispatch_with_permute_impl(
+            paddle.ones([3, 4], dtype="float32"),
+            paddle.to_tensor([[0], [1], [0]], dtype="int64"),
+            paddle.ones([3, 1], dtype="float32"),
+            use_fp8=False,
+        )
+
+        dispatch_kwargs = buffer.dispatch_calls[-1]
+        self.assertEqual(dispatch_kwargs["hidden"].shape, [128, 4])
+        self.assertEqual(dispatch_kwargs["routing_map"].shape, [128, 2])
+        self.assertEqual(dispatch_kwargs["probs"].shape, [128, 2])
+        self.assertEqual(
+            dispatch_kwargs["hidden"][:3].numpy().tolist(),
+            [[1.0] * 4] * 3,
+        )
+        self.assertEqual(
+            dispatch_kwargs["hidden"][3:].astype("int64").sum().item(), 0
+        )
+        self.assertEqual(manager._num_unpadded_tokens, 3)
+        self.assertEqual(manager.num_permuted_tokens, 3)
 
     def test_fp8_dispatch_quantizes_and_aligns_expert_inputs(self):
         manager = _new_hybrid_manager(
@@ -577,7 +638,7 @@ class TestHybridEPDispatchBoundary(unittest.TestCase):
         self.assertEqual(dispatch_kwargs["hidden"].dtype, paddle.float8_e4m3fn)
         self.assertTrue(dispatch_kwargs["use_fp8"])
         self.assertEqual(dispatch_kwargs["pad_multiple"], FP8_ALIGN)
-        self.assertEqual(dispatch_kwargs["scaling_factor"].shape, [4, 1])
+        self.assertEqual(dispatch_kwargs["scaling_factor"].shape, [128, 1])
 
     def test_public_dispatch_uses_router_metadata_and_records_runtime_state(
         self,
@@ -620,8 +681,11 @@ class TestHybridEPDispatchBoundary(unittest.TestCase):
 
         self.assertIsNone(fp8_handle)
         self.assertTrue(paddle.allclose(output, dispatched).item())
-        self.assertIs(manager.dispatched_probs, dispatched_probs)
+        self.assertTrue(
+            paddle.allclose(manager.dispatched_probs, dispatched_probs).item()
+        )
         self.assertIsNone(manager.dispatched_indices)
+        self.assertEqual(manager.num_permuted_tokens, 2)
         self.assertEqual(manager.tokens_per_expert.numpy().tolist(), [1, 1])
         self.assertFalse(buffer.dispatch_calls[-1]["use_fp8"])
 
@@ -661,7 +725,7 @@ class TestHybridEPDispatchBoundary(unittest.TestCase):
             fp8_dispatch=True,
         )
 
-        self.assertIs(fp8_handle["scale"], scale)
+        self.assertTrue(paddle.allclose(fp8_handle["scale"], scale).item())
         self.assertIs(manager.token_indices, token_indices)
         self.assertIs(manager.token_probs, token_weights)
         self.assertEqual(
@@ -881,6 +945,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         manager.padded_tokens_per_expert = paddle.to_tensor(
             [2, 0, 1], dtype="int32"
         )
+        manager.num_permuted_tokens = 3
         custom_map = _HybridEPCustomMap(manager)
 
         counts, num_tokens = _hybrid_ep_prepare_expert_counts(
@@ -895,6 +960,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         manager.padded_tokens_per_expert = paddle.to_tensor(
             [4, 2], dtype="int32"
         )
+        manager.num_permuted_tokens = 6
         counts, num_tokens = _hybrid_ep_prepare_expert_counts(
             custom_map,
             use_fp8_mlp=True,
@@ -904,7 +970,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         self.assertIsInstance(counts, paddle.Tensor)
         self.assertEqual(counts.dtype, paddle.int64)
         self.assertEqual(counts.numpy().tolist(), [4, 2])
-        self.assertEqual(int(num_tokens.item()), 6)
+        self.assertEqual(num_tokens, 6)
 
     def test_prepare_expert_counts_requires_hybrid_ep_counts(self):
         manager = _new_hybrid_manager(
@@ -915,6 +981,15 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         custom_map = _HybridEPCustomMap(manager)
 
         with self.assertRaisesRegex(AssertionError, "padded_tokens_per_expert"):
+            _hybrid_ep_prepare_expert_counts(
+                custom_map,
+                use_fp8_mlp=False,
+                moe_expert_fusion=False,
+            )
+        manager.padded_tokens_per_expert = paddle.to_tensor(
+            [1, 1], dtype="int64"
+        )
+        with self.assertRaisesRegex(AssertionError, "num_permuted_tokens"):
             _hybrid_ep_prepare_expert_counts(
                 custom_map,
                 use_fp8_mlp=False,
@@ -945,6 +1020,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         manager.padded_tokens_per_expert = paddle.to_tensor(
             [0, 0], dtype="int64"
         )
+        manager.num_permuted_tokens = 0
         custom_map = _HybridEPCustomMap(
             manager,
             experts=[_TinyExpert(), _TinyExpert()],
@@ -978,6 +1054,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         manager.padded_tokens_per_expert = paddle.to_tensor(
             [0, 0], dtype="int64"
         )
+        manager.num_permuted_tokens = 0
         custom_map = _HybridEPCustomMap(
             manager,
             experts=[_TinyExpert(), _TinyExpert()],

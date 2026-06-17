@@ -15,6 +15,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+import math
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -201,9 +203,53 @@ class _HybridEPManager(_DispatchManager):
         self.dispatched_probs = None
         self.tokens_per_expert = None
         self.padded_tokens_per_expert = None
+        self.num_permuted_tokens = None
         self.handle = None
         self._active_buffer = None
         self.hybridep_buffer_configs = hybridep_buffer_configs or {}
+        self._num_unpadded_tokens = None
+
+        dispatch_chunk = int(
+            os.environ.get("NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API", "128")
+        )
+        combine_chunk = int(
+            os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
+        )
+        assert dispatch_chunk > 0 and combine_chunk > 0, (
+            "NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API and "
+            "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API must be positive."
+        )
+        self._num_tokens_pad_multiple = math.lcm(dispatch_chunk, combine_chunk)
+
+    def _get_max_num_tokens_per_rank(
+        self, num_local_tokens: int, place
+    ) -> int:
+        max_num_tokens = num_local_tokens
+        if self.group.nranks > 1:
+            max_num_tokens_tensor = paddle.to_tensor(
+                [num_local_tokens], dtype="int64", place=place
+            )
+            paddle.distributed.all_reduce(
+                max_num_tokens_tensor,
+                op=paddle.distributed.ReduceOp.MAX,
+                group=self.group,
+            )
+            max_num_tokens = int(max_num_tokens_tensor.item())
+        pad = self._num_tokens_pad_multiple
+        return ((max_num_tokens + pad - 1) // pad) * pad
+
+    def _pad_tokens_to_rank_max(
+        self, tensor: paddle.Tensor | None, max_num_tokens: int
+    ) -> paddle.Tensor | None:
+        if tensor is None or tensor.shape[0] == max_num_tokens:
+            return tensor
+        assert tensor.shape[0] < max_num_tokens, (
+            f"HybridEP token padding expects local tokens <= EP max, got "
+            f"{tensor.shape[0]} > {max_num_tokens}."
+        )
+        pad_shape = [max_num_tokens - tensor.shape[0], *tensor.shape[1:]]
+        padding = paddle.zeros(pad_shape, dtype=tensor.dtype)
+        return paddle.concat([tensor, padding], axis=0)
 
     def _get_buffer(
         self,
@@ -306,6 +352,14 @@ class _HybridEPManager(_DispatchManager):
             .sum(axis=0)
         )
 
+    def _set_num_permuted_tokens(
+        self, tokens_per_expert: paddle.Tensor
+    ) -> int:
+        self.num_permuted_tokens = int(
+            paddle.sum(tokens_per_expert.astype("int64")).item()
+        )
+        return self.num_permuted_tokens
+
     def dispatch_overlap(
         self,
         hidden_states: paddle.Tensor,
@@ -335,12 +389,22 @@ class _HybridEPManager(_DispatchManager):
         token_weights: paddle.Tensor,
         use_fp8: bool = False,
     ):
-        buffer = self._get_buffer(hidden_states)
+        num_unpadded_tokens = hidden_states.shape[0]
+        max_num_tokens = self._get_max_num_tokens_per_rank(
+            num_unpadded_tokens, hidden_states.place
+        )
+        self._num_unpadded_tokens = num_unpadded_tokens
         routing_map, probs = self._get_dispatch_metadata(
             token_indices, token_weights
         )
+        hidden_states = self._pad_tokens_to_rank_max(
+            hidden_states, max_num_tokens
+        )
+        routing_map = self._pad_tokens_to_rank_max(routing_map, max_num_tokens)
+        probs = self._pad_tokens_to_rank_max(probs, max_num_tokens)
+        buffer = self._get_buffer(hidden_states, max_num_tokens)
         num_permuted_tokens = self._get_num_permuted_tokens_upper_bound(
-            hidden_states.shape[0]
+            max_num_tokens
         )
         scaling_factor = None
         if use_fp8:
@@ -372,6 +436,14 @@ class _HybridEPManager(_DispatchManager):
             non_blocking=True,
         )
         self.padded_tokens_per_expert = tokens_per_expert
+        num_permuted_tokens = self._set_num_permuted_tokens(
+            tokens_per_expert
+        )
+        hidden_states = hidden_states[:num_permuted_tokens]
+        if dispatched_probs is not None:
+            dispatched_probs = dispatched_probs[:num_permuted_tokens]
+        if scale is not None:
+            scale = scale[:num_permuted_tokens]
         (
             _sparse_to_dense_map,
             _rdma_to_attn_map,
@@ -414,9 +486,18 @@ class _HybridEPManager(_DispatchManager):
             raise NotImplementedError(
                 "HybridEP backend does not support combine overlap in PaddleFleet."
             )
-        hidden_states = hybrid_ep_combine(hidden_states, self)
+        hidden_states = hybrid_ep_combine(
+            hidden_states, self, self.num_permuted_tokens
+        )
         self.dispatched_probs = None
         self.handle = None
+        self.num_permuted_tokens = None
+        if (
+            self._num_unpadded_tokens is not None
+            and hidden_states.shape[0] != self._num_unpadded_tokens
+        ):
+            hidden_states = hidden_states[: self._num_unpadded_tokens]
+        self._num_unpadded_tokens = None
         return hidden_states
 
     def get_dispatched_metadata(self) -> paddle.Tensor:
